@@ -1,0 +1,681 @@
+#!/bin/sh
+
+###############################################################
+#
+#	author:	(c) 2013 Sarah Addams 
+#
+#	name: vnet
+#
+# A BASH script written to set up a bridged virtual network
+# such that a full, externally accessible test network with
+# DHCP support can be trivially created.
+#
+# Requires: The 'ip' tools; sole access to dnsmasq; 
+#		ipv4; bc; brctl; tunctl; sudo
+#
+# I used the following convention for subnet masks: all masks
+# are specified in bit-count form, ie the '255.255.128.0' mask 
+# will be specified as '17'. Translations to dotquad are done
+# locally within functions where necessary.
+#
+# I'd like to upgrade it to handle ipv6 and multiple virtual nets
+# at some point.
+#
+tap_args()
+{
+	local i tlist olist
+
+	tlist=$1
+	olist=""
+
+	for i in $tlist
+	do
+		olist="$olist -t $i"
+	done
+	echo $olist
+	return 0
+}
+
+bcastaddress()
+{
+	local ip netmask dq bit_address ip nmbitunset nmbitfloor netaddress n
+
+        IFS="."
+
+        ip=$1
+        netmask=$2
+	dq=""
+
+        bit_address=0 
+
+        for i in $ip 
+        do
+                bit_address=`echo "$bit_address * 256 + $i" | bc`
+        done
+
+	unset IFS
+
+	# Thinking out loud:
+	#
+	# nmbitset=`echo "( ( 2 ^ $netmask ) - 1 ) * 2 ^ ( 32 - $netmask )" | bc`
+	nmbitunset=`echo "( 2 ^ ( 32 - $netmask ) ) - 1" | bc`
+
+	nmbitfloor=`echo "2 ^ ( 32 - $netmask )" | bc`
+
+        netaddress=`echo "( $bit_address / $nmbitfloor ) * $nmbitfloor" | bc` 
+
+	n=`echo "$netaddress + $nmbitunset" | bc`
+
+	while [ $n -ne 0 ]
+	do
+		r=`echo "$n % 256" | bc`
+		n=`echo "$n / 256" | bc`
+		if [ -z "${dq}" ]
+		then
+			dq="$r"
+		else
+			dq="$r.$dq"
+		fi
+	done
+
+	echo $dq
+} 
+
+netaddress()
+{
+	local ip netmask dq bit_address ip nmbitunset nmbitfloor netaddress n
+
+        IFS="."
+
+        ip=$1
+        netmask=$2
+	dq=""
+
+        bit_address=0 
+
+        for i in $ip 
+        do
+                bit_address=`echo "$bit_address * 256 + $i" | bc`
+        done
+
+	unset IFS
+
+	nmbitfloor=`echo "2 ^ ( 32 - $netmask )" | bc`
+
+        netaddress=`echo "( $bit_address / $nmbitfloor ) * $nmbitfloor" | bc` 
+
+	n=$netaddress
+
+	while [ $n -ne 0 ]
+	do
+		r=`echo "$n % 256" | bc`
+		n=`echo "$n / 256" | bc`
+		if [ -z "${dq}" ]
+		then
+			dq="$r"
+		else
+			dq="$r.$dq"
+		fi
+	done
+
+	echo $dq
+} 
+
+# convert a numeric netmask to dotted quad
+bit2dotquad()
+{
+	local b i dq
+
+	b=$1
+	dq=""
+
+	i=`echo "( ( 2 ^ $b ) - 1 ) * 2 ^ ( 32 - $b )" | bc`
+
+	while [ $i -gt 0 ]
+	do
+		r=`echo $i % 256 | bc`
+		i=`echo $i / 256 | bc`
+		if [ ! -z "$dq" ]
+		then
+			dq="$r.$dq"
+		else
+			dq=$r
+		fi
+	done
+
+	echo $dq
+	return 0
+}
+
+# Basic existence check for network device
+check_dev()
+{
+	ip link show dev $1 >/dev/null 2>&1
+	return $?
+}
+
+# Add unique tap device to tap list
+#
+# add_unique_tap "<list of tap devs>" <tap_dev>
+#
+add_unique_tap() 
+{ 
+	local tap_dev tap_list i
+
+        tap_dev=$2 
+        tap_list=$1 
+
+	if [ -z $tap_dev ]
+	then
+		echo $tap_list
+		return 0
+	fi
+
+        for i in $tap_list 
+        do 
+                if [ $i == $tap_dev ] 
+                then 
+                        echo $tap_list 
+                        return 0 
+                fi 
+        done 
+
+        echo $tap_dev $tap_list 
+        return 0 
+} 
+
+hostip4()
+{
+	local tag data
+
+	set -- `ip -f inet addr show dev $1 | grep "inet"`
+	tag=$1
+	data=$2
+
+	if [ ".$tag" == ".inet" ]
+	then
+		echo $data | sed 's?/.*$??'
+		return 0
+	fi
+	return 1
+}
+
+hostnetmask4()
+{
+	local tag data
+
+	set -- `ip -f inet addr show dev $1 | grep "inet"`
+	tag=$1
+	data=$2
+
+	if [ ".$tag" == ".inet" ]
+	then
+		echo $data | sed 's?^.*/??'
+		return 0
+	fi
+	return 1
+}
+
+hostbcast4()
+{
+	local tag bcast
+
+	set -- `ip -f inet addr show dev $1 | grep "inet"`
+	tag=$1
+	bcast=$4
+
+	if [ ".$tag" == ".inet" ]
+	then
+		echo $bcast
+		return 0
+	fi
+	return 1
+}
+
+# Get the default route for the given interface
+defaultroute4()
+{
+	local tag addr
+
+	set -- `ip -f inet route show default dev $1 | grep default`
+	tag=$1
+	addr=$3
+	if [ ".$tag" == ".default" ]
+	then
+		echo "$addr"
+		return 0
+	fi
+	return 1
+}
+
+########################################################################################
+#
+#		*  *  *  D A N G E R  *  *  *
+#
+# If you're already using DNSMASQ as your DHCP server, this code WILL stuff your 
+# DHCP setup. I chose dnsmasq as it was unused and it gave me a quick and simple way 
+# implement a DHCP setup for the virtual net without horking all over my laptop's
+# jewel-like mechanisms and assorted sundry other frilly bits.
+# 
+# DHCPinit <bridge interface> <bridge ip address> <virtual net domain name> ...
+#	<DHCP pool start address> <DHCP pool end address> <DHCP subnet mask> ...
+#	[ <NTP server address> ]
+#
+# 
+DHCPinit()
+{
+	bridge_if=$1
+	bridge_ip=$2
+	vnet_name=$3
+	dhcp_pool_start=$4
+	dhcp_pool_end=$5
+	dhcp_subnet_mask=$6
+	ntp_server=$7
+	dq_mask=`bit2dotquad $dhcp_subnet_mask`
+
+	cp /dev/null /etc/dnsmasq.conf
+
+	echo "domain-needed" >> /etc/dnsmasq.conf
+	echo "bogus-priv" >> /etc/dnsmasq.conf
+	echo "filterwin2k" >> /etc/dnsmasq.conf
+	echo "expand-hosts" >> /etc/dnsmasq.conf
+	echo "read-ethers" >> /etc/dnsmasq.conf
+	echo "dhcp-authoritative" >> /etc/dnsmasq.conf
+	echo "interface=$bridge_if" >> /etc/dnsmasq.conf
+	echo "dhcp-range=$dhcp_pool_start,$dhcp_pool_end,$dq_mask,72h" >> /etc/dnsmasq.conf
+	echo "domain=$vnet_name" >> /etc/dnsmasq.conf
+	echo "dhcp-option=option:router,$bridge_ip" >> /etc/dnsmasq.conf
+	echo "dhcp-option=option:mtu,1450" >> /etc/dnsmasq.conf
+	if [ ! -z "${ntp_server}" ]
+	then
+		echo "dhcp-option=option:ntp-server,$ntp_server" >> /etc/dnsmasq.conf
+	fi
+	dnsmasq -q
+
+	return 0
+}
+
+# Kill the DHCP server
+DHCPterminate()
+{
+	( killall dnsmasq; rm -f /etc/dnsmasq.conf ) >/dev/null 2>&1
+}
+
+# Set up the tap interface and bridge it with $ETH
+do_setup()
+{
+	owner=$1
+	bridge_if=$2
+	bridge_ip=$3
+	vnet_name=$4
+	ip_pool_start=$5
+	ip_pool_end=$6
+	ip_netmask=$7
+	ntp_server=$8
+	tap_list=$9
+
+	# check that the bridge interface does not exist
+	check_dev $bridge_if
+
+	if [ $? -eq 0 ]
+	then
+		echo "The given BRIDGE interface - $bridge_if - already exists. adding $tap_list"
+	else
+		# Now connect $host_if  and the tap interfaces to a bridge
+		brctl addbr $bridge_if
+		brctl setfd $bridge_if 0
+		brctl setageing $bridge_if 0
+		brctl stp $bridge_if off
+
+		# todo save original setting
+		sysctl -w net.ipv4.ip_forward=1
+	
+		ip link set dev $bridge_if up
+		
+		ip_bcast=`bcastaddress $bridge_ip $ip_netmask`
+		ip -f inet address add "$bridge_ip/$ip_netmask" brd $ip_bcast dev $bridge_if
+		if [ $? -eq 0 ]
+		then
+			echo "Bridge interface $bridge_if created and given an address."
+		else
+			echo "Some part of the bridge creation failed - exiting."
+			exit 1
+		fi
+
+		# Start DNSMASQ on the bridge interface
+		DHCPinit $bridge_if $bridge_ip $vnet_name $ip_pool_start $ip_pool_end $ip_netmask $ntp_server
+		if [ $? -eq 0 ]
+		then
+			echo "DHCP server listening on $bridge_if."
+		fi
+	fi
+	
+	# Create the tap interface(s) and...
+	for tap_if in $tap_list
+	do
+
+		# check that the tap interface does not exist
+		check_dev $tap_if
+	
+		if [ $? -eq 0 ]
+		then
+			echo "Ignored because the given TAP interface - $tap_if - already exists."
+			continue
+		fi
+
+		if [ -z "$owner" ]
+		then
+			tunctl -t $tap_if >/dev/null 2>&1
+		else
+			tunctl -t $tap_if -u $owner >/dev/null 2>&1
+		fi
+		ip link set $tap_if up
+		ip link set $tap_if promisc on
+		ip link set $tap_if multicast on
+	
+		# ...add it(them) to the bridge
+		/usr/sbin/brctl addif $bridge_if $tap_if >/dev/null 2>&1
+		# /sbin/ifconfig $tap_if 0.0.0.0
+		
+		if [ -z "$owner" ]
+		then
+			echo "$tap_if device created."
+		else
+			echo "$tap_if device created and owned by $owner."
+		fi
+	done
+
+	return 0
+}
+
+# Reset the network interface to its original config
+do_reset()
+{
+	bridge_if=$1
+	tap_list=$2
+
+	# Kill the DHCP server and nuke its configuration
+	DHCPterminate
+
+	for tap_if in $tap_list
+	do
+		ip link set dev $tap_if down >/dev/null 2>&1
+		r=$?
+		tunctl -d $tap_if >/dev/null 2>&1
+		if [ $r -eq 0 ]
+		then
+			echo "Tap device $tap_if deleted."
+		fi
+	done
+
+        # check that the bridge interface does not exist
+        # I'll add support for multiple taps per bridge later
+        check_dev $bridge_if
+
+        if [ $? -eq 0 ]
+        then
+		ip link set dev $bridge_if down >/dev/null 2>&1
+		brctl delbr $bridge_if
+		if [ $? -ne 0 ]
+		then
+			echo "Could not delete bridge - check to see if it's still in use..."
+		else
+			echo "Bridge deleted."
+		fi
+	fi
+	return 0
+}
+
+# Username to numeric user id - return 0 on success
+n2u()
+{
+	local username userid uname passwd uid junk
+        IFS=":"
+        username=$1
+        if [ -z $username ]
+        then
+                return 1
+        fi
+        userid=`( while read uname passwd uid junk 
+        do
+                if [ $username == $uname ]
+                then
+                        echo $uid
+			break
+                fi
+        done ) </etc/passwd`
+
+	unset IFS
+
+        if [ -z $userid ]
+        then
+                return 1
+        fi
+	echo $userid
+        return 0
+}
+
+# Convert numeric user id to username - return 0 if success
+u2n()
+{
+	local username userid passwd uname uid junk
+
+        IFS=":"
+        userid=$1
+        if [ -z $userid ]
+        then
+                return 1
+        fi
+        username=`( while read uname passwd uid junk 
+        do
+                if [ $userid -eq $uid ]
+                then
+                        echo $uname
+			break
+                fi
+        done ) </etc/passwd`
+
+	unset IFS
+
+        if [ -z $username ]
+        then
+                return 1
+        fi
+	echo $username
+        return 0
+}
+
+# Numeric userid of the calling account
+userid()
+{
+	echo `id | sed 's/uid=\([[:digit:]]*\)(.*$/\1/'`
+	return 0
+}
+
+# Username of the callling account
+username()
+{
+	uid=`userid`
+	echo `u2n $uid`
+}
+
+usage() 
+{ 
+	local bn
+	bn=`basename $0`
+	echo "$bn:"
+	echo "	A script to set up or tear down a virtual subnet."
+	echo ""
+	echo "	vnet -c | -d [-u <user name>] [-b <bridge device>]"
+	echo "		[-t <tap device> [-t <tap device 2> [-t <tap device N>]]]"
+	echo ""
+	exit 1; 
+}
+
+#######################################################################
+##
+## 	Command-line and config file processing code
+##
+##	Command-line options take precedence over config file
+##
+##	Config file options take precedence over defaults
+
+script="$0"
+bridge_if="vbr0"
+bridge_ip="10.0.0.1"
+ip_netmask="23"
+ip_pool_start="10.0.0.10"
+ip_pool_end="10.0.0.240"
+vnet_name="vnet"
+tap_list_conf=""
+tap_list_arg=""
+tap_list="vnet0 vnet1"
+owner_conf=""
+owner_arg=""
+owner=`username`
+vnetconf_list="$HOME/.vnetrc /etc/vnet.conf"
+
+unset task IFS
+
+while getopts ":u:i:t:b:cdD" o; 
+do
+	case "${o}" in
+	D)
+		set -x
+		;;
+	i)
+		host_if=${OPTARG}
+		;;
+	b)
+		bridge_if=${OPTARG}
+		;;
+	t)
+		tap_list_arg=`add_unique_tap "$tap_list_arg" ${OPTARG}`
+		;;
+	# create the virtual network
+	c)
+		task="create"
+		;;
+	# destroy the virtual network
+	d)
+		task="destroy"
+		;;
+	u)
+		owner_arg=${OPTARG}
+		;;
+        *)
+            usage
+            ;;
+	esac
+done
+
+shift $((OPTIND-1))
+
+###############################################################################
+# Process the configuration file (this and the arg processing is rather messy
+###############################################################################
+for vnetconf in $vnetconf_list
+do
+	if [ -f $vnetconf ]
+	then
+		nvpairs=`cat $vnetconf | sed 's/[[:space:]]*#.*$//' | sed 's/^\([^[:space:]][^[:space:]]*\)[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\)/\1:\2/'`
+
+		for nvpair in $nvpairs
+		do
+			IFS=":"
+			set -- $nvpair
+			unset IFS
+			tag=$1
+			data=$2
+
+			if [ -z "${tag}" ]
+			then
+				echo "Error in $vnetconf - exiting."
+			fi
+
+			if [ -z "${data}" ]
+			then
+				echo "Error in $vnetconf - exiting."
+			fi
+			case $tag in
+				'user')
+					owner_conf=$data
+					;;
+				'if')
+					tap_list_conf=`add_unique_tap "$tap_list_conf" $data`
+					;;
+				*)
+					echo "Error in $vnetconf - exiting."
+					exit 1
+					;;
+			esac
+		done
+		break
+	fi
+done
+
+if [ -z "${owner_arg}" ]
+then
+	if [ -z "${owner_conf}" ]
+	then
+		true
+	else
+		owner=$owner_conf
+	fi
+else
+	owner=$owner_arg
+fi
+
+if [ -z "${tap_list_arg}" ]
+then
+	if [ -z "${tap_list_conf}" ]
+	then
+		true
+	else
+		tap_list="$tap_list_conf"
+	fi
+else
+	tap_list="$tap_list_arg"
+fi
+
+n2u $owner >/dev/null
+if [ $? -ne 0 ]
+then
+	echo "Exiting because $owner_arg is not a valid user..."
+	exit 1
+fi
+
+##########################################################################
+#
+#	This is where the script creates or destroys your virtual net
+#
+
+if [ -z "${task}" ]
+then
+	echo "Nothing to do (you need to create - -c - or destroy - -d - the virtual net)."
+	exit 1
+else
+	uid=`userid`
+	if [ $task == "destroy" ]
+	then
+		if [ $uid -gt 0 ]
+		then
+			sudo "$script" -d -b $bridge_if `tap_args "$tap_list"`
+		else
+			do_reset $bridge_if "$tap_list"
+		fi
+	fi
+	if [ $task == "create" ]
+	then
+		if [ $uid -gt 0 ]
+		then
+			sudo "$script" -c -b $bridge_if -u "$owner" `tap_args "$tap_list"`
+		else
+			do_setup $owner $bridge_if $bridge_ip $vnet_name \
+				$ip_pool_start $ip_pool_end $ip_netmask \
+				"$ntp_server" "$tap_list"
+		fi
+	fi
+fi
+
+exit $?
